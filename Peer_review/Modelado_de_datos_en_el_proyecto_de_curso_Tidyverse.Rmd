@@ -1,0 +1,397 @@
+---
+title: "Modelado de datos en el proyecto de curso Tidyverse"
+author: "H.A.A.G."
+date: "2025-06-28"
+output: html_document
+---
+
+# Objetivo
+
+El objetivo de este proyecto es predecir la categoría de reclamación del consumidor. Esta es la variable "Producto" en el conjunto de datos de entrenamiento.
+
+# Carga de Librerías
+
+```{r}
+
+library(pacman)
+
+pacman::p_load(
+    readr,
+    dplyr,
+    tidyverse,
+    skimr,
+    tidytext,
+    janitor,
+    knitr,
+    tm,
+    kknn,
+    ggplot2,
+    tidytext,
+    rsample,
+    recipes,
+    workflows,
+    yardstick,
+    here
+)
+
+```
+
+# Carga de Datos
+
+```{r}
+
+dftest <- read_csv(here("data_complaints_test.csv"))
+
+dftrain <- read_csv(here("data_complaints_train.csv"))
+
+```
+
+# Exploración de los Datos
+
+```{r}
+
+dftrain %>%
+    glimpse()
+
+cp <- dftrain %>% 
+    rename(
+        product = Product,
+        complaint = `Consumer complaint narrative`,
+        company = Company,
+        state = State,
+        zip = `ZIP code`,
+        submitted = `Submitted via`
+    )
+
+quizz <- dftest %>% 
+    rename(
+        id = problem_id,
+        complaint = `Consumer complaint narrative`,
+        company = Company,
+        state = State,
+        zip = `ZIP code`,
+        submitted = `Submitted via`
+    )
+
+skim(cp)
+
+```
+
+```{r}
+# Descartando columnas
+
+cp <- cp %>% 
+    select(-submitted, -state, -zip)
+
+quizz <- quizz %>% 
+    select(-submitted, -state, -zip)
+
+# Cambiando nombre de columnas
+
+cp <- cp %>% 
+    mutate(product = ifelse(product == 'Credit card or prepaid card', 'credit', 
+      ifelse(product == 'Mortgage', 'mortgage', 
+      ifelse(product == 'Student loan', 'student', 
+      ifelse(product == 'Vehicle loan or lease', 'vehicle', NA)))))
+
+# Agregando id a datos de entrenamiento
+
+cp <- cp %>% 
+    mutate(id = row_number()) %>% 
+    select(id, product, complaint, company)
+
+cp_words <- cp %>%
+    unnest_tokens(word, complaint)
+
+# Removiendo algunas palabras
+
+cp_words <- cp_words %>% 
+    filter(word != 'x' & word != 'xx' & word != 'xxx' & word != 'xxxx') %>% 
+    filter(!str_detect(word, "[[:punct:]]")) %>% 
+    filter(!str_detect(word, "^[0-9]*$"))
+
+cp_words_quizz <- quizz %>%
+    unnest_tokens(word, complaint)
+
+cp_words_quizz <- cp_words_quizz %>% 
+    filter(word != 'x' & word != 'xx' & word != 'xxx' & word != 'xxxx') %>% 
+    filter(!str_detect(word, "[[:punct:]]")) %>% 
+    filter(!str_detect(word, "^[0-9]*$"))
+
+cp_words <- cp_words %>% 
+    anti_join(stop_words)
+
+cp_words_quizz <- cp_words_quizz %>% 
+    anti_join(stop_words)
+
+# Contando Palabras
+
+cp_words.freq <- cp_words %>%
+    count(word, sort = TRUE)
+
+```
+
+# Graficando Palabras Frecuentes
+
+```{r}
+
+cp_words.freq %>%
+    top_n(wt = n, n = 30) %>% 
+    mutate(word = reorder(word, n)) %>% 
+    ggplot(aes(word, n)) + 
+    geom_col() + 
+    xlab(NULL) + 
+    coord_flip()
+
+```
+
+```{r}
+
+# Contando palabras por producto
+
+cp_products_words.freq <- cp_words %>%
+    count(product, word, sort = TRUE)
+
+```
+
+# Graficando las Palabras más Frecuentes
+
+```{r}
+
+cp_products_words.freq %>%
+    mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+    group_by(product) %>% 
+    slice_max(order_by = n, n = 20) %>% 
+    ungroup() %>%
+    ggplot(aes(word, n, fill = product)) +
+    geom_col(show.legend = FALSE) +
+    labs(x = NULL, y = "n") +
+    facet_wrap(~ product, ncol = 4, scales = "free") +
+    coord_flip()
+
+```
+
+```{r}
+
+# Top de Palabras
+
+cp_words.freq %>%
+    print(n = 50)
+
+```
+
+```{r}
+
+# Extrayendo palabras top
+
+cp_words_top <- cp_words %>% 
+    filter(word %in% c('card', 'credit', 'mortgage', 'loan', 'account', 'payment',
+      'bank', 'payments', 'home', 'told', 'recieved', 'called', 
+      'time', 'company', 'balance', 'pay', 'escrow', 'loans', 
+      'due', 'letter', 'amount', 'modification', 'property', 'paid',
+      'charge', 'charges', 'call', 'late', 'information', 'dispute',
+      'customer', 'car', 'navient', 'month', 'student', 'vehicle',
+      'financial', 'income', 'repayment'))
+
+cp_words_top_quizz <- cp_words_quizz %>% 
+    filter(word %in% c('card', 'credit', 'mortgage', 'loan', 'account', 'payment',
+      'bank', 'payments', 'home', 'told', 'recieved', 'called', 
+      'time', 'company', 'balance', 'pay', 'escrow', 'loans', 
+      'due', 'letter', 'amount', 'modification', 'property', 'paid',
+      'charge', 'charges', 'call', 'late', 'information', 'dispute',
+      'customer', 'car', 'navient', 'month', 'student', 'vehicle',
+      'financial', 'income', 'repayment'))
+
+# Contando palabras por id
+
+cp_words_top_count <- cp_words_top %>%
+    count(id, word)
+
+cp_words_top_count_quizz <- cp_words_top_quizz %>%
+    count(id, word)
+
+# Combinando datos
+
+cp_words_top_join <- inner_join(cp_words_top, cp_words_top_count,
+  by = c("id", "word"))
+
+cp_words_top_join_quizz <- inner_join(cp_words_top_quizz,
+  cp_words_top_count_quizz, by = c("id", "word"))
+
+# Creando tabla ancha
+
+cp_words_wide <- cp_words_top_join %>% 
+    unique() %>% 
+    pivot_wider(names_from = word, 
+                values_from = n,
+                values_fill = 0,
+                names_repair = 'minimal'
+    )
+
+cp_words_wide_quizz <- cp_words_top_join_quizz %>% 
+    unique() %>% 
+    pivot_wider(names_from = word, 
+                values_from = n,
+                values_fill = 0,
+                names_repair = 'minimal'
+    )
+
+```
+
+```{r}
+
+# Eliminando columnas
+
+cp_words_wide_ml <- cp_words_wide %>% 
+    select(-company, -id)
+
+cp_words_wide_ml_quizz <- cp_words_wide_quizz %>% 
+    select(-company, -id)
+
+cp_split <- initial_split(cp_words_wide_ml, strata = product, prop = 0.8)
+
+cp_train <- training(cp_split)
+
+head(cp_train)
+
+```
+
+```{r}
+
+count(cp_train, product)
+
+```
+
+```{r}
+
+cp_test <- testing(cp_split)
+
+head(cp_test)
+
+```
+
+```{r}
+
+count(cp_test, product)
+
+```
+
+#Construcción de receta
+
+```{r}
+
+cat_recipe <- cp_train %>%
+    recipe(product ~ .)
+
+```
+
+# Construcción de Modelo
+
+```{r}
+
+cat_model <- parsnip::nearest_neighbor() %>%
+    parsnip::set_mode(mode = 'classification')
+
+cat_model
+
+```
+
+#Construcción de Flujo de Trabajo
+
+```{r}
+
+cat_wflow <- workflows::workflow() %>%
+    workflows::add_recipe(recipe = cat_recipe) %>%
+    workflows::add_model(spec = cat_model)
+
+cat_wflow
+
+```
+
+```{r}
+
+cat_wflow_fit <- parsnip::fit(cat_wflow, data = cp_train)
+
+cat_wflow_fit
+
+```
+
+# Ajustando el Modelo
+
+```{r}
+
+wf_fit_cat <- cat_wflow_fit %>% 
+    extract_fit_parsnip()
+
+pred_product <- predict(cat_wflow_fit, new_data = cp_train)
+
+table(pred_product)
+
+```
+
+# Viendo la Precisión
+
+```{r}
+
+cp_train_results <- bind_cols(cp_train, pred_product) %>%
+  mutate(
+    product = as.factor(product),
+    .pred_class = as.factor(.pred_class)
+  )
+
+print(
+  yardstick::accuracy(cp_train_results, truth = product, estimate = .pred_class)
+)
+
+```
+
+```{r}
+
+count(cp_train, product)
+
+```
+
+```{r}
+
+count(pred_product, .pred_class)
+
+```
+
+```{r}
+
+predicted_and_truth <- bind_cols(cp_train,
+                                 predicted_product = pull(pred_product, 
+                                                          .pred_class))
+
+head(predicted_and_truth)
+
+```
+
+```{r}
+
+# Añadiendo columna
+
+cp_words_wide_ml_quizz_added <- cp_words_wide_ml_quizz %>% 
+    mutate(property = 0, navient = 0, recieved = 0)
+
+```
+
+# Predicción
+
+```{r}
+
+pred_product_quizz <- predict(cat_wflow_fit, new_data = cp_words_wide_ml_quizz_added)
+
+table(pred_product_quizz)
+
+```
+
+```{r}
+
+predicted_and_truth_quizz <- bind_cols(quizz,
+                                       predicted_product = pull(pred_product_quizz, .pred_class))
+
+predicted_and_truth_quizz %>% 
+    select(id, predicted_product)
+
+```

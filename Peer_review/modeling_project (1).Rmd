@@ -1,0 +1,184 @@
+---
+title: "modeling_project"
+output: html_document
+date: "2025-07-25"
+---
+
+```{r}
+library(rsample)
+library(recipes)
+library(tidyverse)
+library(parsnip)
+library(workflows)
+library(yardstick)
+library(tune)
+library(skimr)
+library(tidytext)
+library(tm)
+library(here)
+library(ranger)
+library(vip)
+
+#reading the data into R
+complaints_train <- read_csv(here("modeling_final/data/complaints_train.csv"),name_repair = "universal")
+complaints_test <- read_csv(here("modeling_final/data/complaints_test.csv"),name_repair = "universal")
+```
+
+```{r}
+##Data Wrangling
+#looking at an overview of the data for variables that must be transformed
+skim(complaints_train)
+
+#changing the "none" values to NA
+complaints_train <- complaints_train %>% mutate(ZIP.code=na_if(ZIP.code,"None"))
+complaints_test <- complaints_test %>% mutate(ZIP.code=na_if(ZIP.code,"None"))
+
+#removing "XX" or "XXXX" from "consumer complaint narrative"
+complaints_train <- complaints_train %>% 
+  mutate(Consumer.complaint.narrative=str_remove_all(Consumer.complaint.narrative,"\\bX{2,4}\\b" ))
+complaints_test <- complaints_test %>% 
+  mutate(Consumer.complaint.narrative=str_remove_all(Consumer.complaint.narrative,"\\bX{2,4}\\b" ))
+
+#adding in "problem_id" to training data
+complaints_train <- complaints_train %>% mutate(problem_id=c(1:nrow(complaints_train)))
+
+#generating a new three column DF with 'problem_id' and 'word'
+complaints_words <- complaints_train %>% select(problem_id,Consumer.complaint.narrative)
+
+#unnesting the consumer complaint into individual words
+complaints_words <- complaints_words %>%
+  unnest_tokens(word, Consumer.complaint.narrative)
+
+#removing filler words
+complaints_words_clean <- complaints_words %>%
+          anti_join(stop_words, by = "word")
+
+#making a DocumentTermMatrix recording non-filler words with how frequent a word occurs per complaint
+dtm <- complaints_words_clean %>%
+       count(problem_id, word) %>%
+        filter(n >= 5)%>% #filter for only most commonly used words in complaint(>5 times used)
+       cast_dtm(problem_id, word, n)
+
+#convert dtm to matrix and then to df
+dtm_matrix <-as.matrix(dtm)
+
+dtm_df <- as.data.frame(dtm_matrix) %>%
+  rownames_to_column("problem_id") %>%
+  mutate(problem_id = as.factor(problem_id))
+
+#change all of the problem_id varibales to factors
+complaints_train <- complaints_train %>% mutate(problem_id = as.factor(problem_id))
+complaints_test <- complaints_test %>% mutate(problem_id = as.factor(problem_id))
+
+#join the dtm with original training data
+new_training <- inner_join(complaints_train,dtm_df)
+
+#repeat the above steps for testing data to have word frequency info
+words_testing <- complaints_test %>% select(problem_id,Consumer.complaint.narrative)
+words_testing <- words_testing %>%
+  unnest_tokens(word, Consumer.complaint.narrative)
+words_testing_clean <- words_testing %>%
+  anti_join(stop_words, by = "word")
+dtm_test <- words_testing_clean %>%
+  count(problem_id, word) %>%
+  filter(n >= 5)%>% #filter for only most commonly used words in complaint(>5 times used)
+  cast_dtm(problem_id, word, n)
+dtm_matrix_test <-as.matrix(dtm_test)
+dtm_df_test <- as.data.frame(dtm_matrix_test)
+dtm_df_test <- dtm_df_test %>% tibble::rownames_to_column(var = "problem_id")
+dtm_df_test <- dtm_df_test %>% mutate(problem_id = as.factor(problem_id))
+new_testing <- left_join(complaints_test,dtm_df)
+
+#remove consumer.comlpaint.narrative as the desired data is in a new format and
+new_training <- new_training %>% select(-Consumer.complaint.narrative)
+new_testing <- new_testing %>% select(-Consumer.complaint.narrative)
+
+#remove Submitted.via because all were submitted via web
+new_training <- new_training %>% select(-Submitted.via)
+new_testing <- new_testing %>% select(-Submitted.via)
+
+#change product, company, and state to factors for analysis
+new_training <- new_training %>% mutate(across(c(Company,State,Product), as.factor))
+new_testing <- new_testing %>% mutate(across(c(Company,State), as.factor))
+```
+
+```{r}
+##Model Generation
+#build recipe
+complaints_recipe <- new_training%>%
+  recipe()%>%
+  update_role(everything(), new_role = "predictor") %>%
+  update_role(Product, new_role = "outcome") %>%
+  update_role(problem_id, new_role = "id variable") %>%
+  update_role(ZIP.code, new_role = "location id")
+
+#run and check pre-processed data
+prepped_rec <- prep(complaints_recipe, verbose=TRUE, retain=TRUE)
+prepped_train <- bake(prepped_rec, new_data = NULL)
+glimpse(prepped_train)
+#removed the glimpse from rmd because of excessive col # for viewing
+
+#run and check testing data pre-processing
+prepped_test <- bake(prepped_rec, new_data = new_testing)
+#removed the glimpse from rmd because of excessive col # for viewing
+
+#specify the model - random forest
+complaints_tree_model <- 
+  parsnip::rand_forest(mtry = 10, min_n = 4)
+
+complaints_tree_model <- complaints_tree_model%>%
+  parsnip::set_mode("classification")%>%
+  parsnip::set_engine("ranger", importance="impurity")
+
+#workflow
+complaints_wflow <- workflows::workflow() %>%
+  workflows::add_recipe(complaints_recipe) %>%
+  workflows::add_model(complaints_tree_model)
+
+#fit the model to the training data
+complaints_wflow_fit <- parsnip::fit(complaints_wflow, data=new_training)
+
+#extract predicted values for an accuracy assessment
+wf_fit <- complaints_wflow_fit %>% 
+  extract_fit_parsnip()
+wf_predictions <- predict(complaints_wflow_fit, new_data = prepped_train) %>%
+  bind_cols(prepped_train %>% select(Product))
+
+#look at most important factors
+wf_fit %>% 
+  vip(num_features = 10)
+#it appears that Company is the most important factor, followed by the number of times
+#"card" was used in a complaint, followed by the use of "mortgage" in a complaint
+
+#quantify model performance
+yardstick::metrics(wf_predictions, truth=Product, estimate=.pred_class)
+#this suggests that accuracy is about 79.7%
+
+##my preference at this stage would be to tune the hyperparameters mtry and min_n to improve accuracy
+#however, my computer does not have the processing power to do so on a dataset of this size
+```
+
+```{r}
+##Cross-Validation
+#create vfolds:
+set.seed(12345)
+vfold_comp <- rsample::vfold_cv(data=new_training,v=5)
+
+#fit to vfolds to cross-validate accuracy
+set.seed(456)
+resample_fit <- tune::fit_resamples(complaints_wflow, vfold_comp)
+collect_metrics(resample_fit)
+#accuracy with resampling is 77.1% - consistent with original analysis
+```
+
+```{r}
+##Generating predictions for the test data
+#running the model on test data
+predictions_test <- predict(complaints_wflow_fit, new_data = prepped_test)
+predictions_test <- predictions_test%>% tibble::rownames_to_column(var = "problem_id")
+predictions_test <- left_join(complaints_test,predictions_test)
+predictions_test
+#see column to the far right (".pred_class") for predictions
+```
+
+

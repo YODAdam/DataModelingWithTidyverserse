@@ -1,0 +1,128 @@
+---
+title: "Machine Learning Project"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-07-28"
+---
+
+The purpose of the assignment is to build a ML model to predict the Product column. To do this, the Consumer Complaint Narrative column is used as the only parameter in the model, since it describes the consumer's problem and hence provides a good hint for which product they are complaining about. 
+
+# Edit Training data for count and type of words in Consumer Complaint Narrative
+
+We want to use the number of times any specific word is used in the complaint to predict the Product category of the complaint. To do this we create a new column for each word (excluding stop words) and count the number of times it appears in each complaint id.
+```{r warning=FALSE, include = FALSE }
+library(tidyverse)
+library(tidytext)
+library(tidymodels)
+library(randomForest)
+library(ggplot2)
+library(forcats)
+
+dir <- getwd()
+
+testing_data <- read_csv(paste0(dir, "/data_complaints_test.csv"))
+
+training_data <- read_csv(paste0(dir, "/data_complaints_train.csv"), n_max = 10000)
+```
+```{r}
+# Step 1: Add ID to each complaint
+training_data <- training_data %>% mutate(id_number = row_number())
+
+# Step 2: Tokenize and count all word frequencies
+tokens <- training_data %>%
+  unnest_tokens(word, `Consumer complaint narrative`) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "x+"))
+
+# Step 3: Identify top 50 most frequent words
+top_words <- tokens %>%
+  count(word, sort = TRUE) %>%
+  slice_max(n, n = 50) %>%
+  pull(word)
+
+# Step 4: Count top word occurrences per complaint
+word_counts <- tokens %>%
+  filter(word %in% top_words) %>%
+  count(id_number, word) %>%
+  pivot_wider(names_from = word, values_from = n, values_fill = 0)
+
+# Step 5: Merge with Product label
+model_data <- training_data %>%
+  select(id_number, Product) %>%
+  left_join(word_counts, by = "id_number") %>%
+  mutate(across(all_of(top_words), ~replace_na(., 0)))
+```
+
+# Building Model using word count and type as parameters
+
+We train the ML model based purely on the number of times the words were used in the Consumer Complaint Narrative to classify the complaint (i.e. to predict the Product column).
+
+```{r}
+# Step 6: Build recipe and model
+recipe_obj <- recipe(Product ~ ., data = model_data) %>%
+  update_role(id_number, new_role = "ID")
+
+rf_model <- rand_forest(mode = "classification") %>%
+  set_engine("randomForest")
+
+workflow_obj <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(recipe_obj)
+
+# Step 7: Cross-validation
+folds <- vfold_cv(model_data, v = 5)
+
+results <- fit_resamples(workflow_obj, resamples = folds, control = control_resamples(save_pred = TRUE))
+metrics <- collect_metrics(results)
+predictions <- collect_predictions(results)
+```
+
+# Plots and Results Summary
+
+```{r, echo = FALSE}
+library(knitr)
+
+p1_plot_data <- tokens %>%
+  group_by(word, Product) %>%
+  tally() %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  group_by(Product) %>%
+  slice_max(order_by = n, n = 10) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, n, Product))
+
+p1 <- ggplot(p1_plot_data, aes(x = word, y = n)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~Product, scales = "free_y") +
+  scale_x_reordered() +
+  theme_minimal() +
+  labs(title = "Top 10 Words Counts by Product Category") +
+  theme(plot.title = element_text(hjust = 0.5, vjust = 0.5, face = "bold"))
+
+p2 <- autoplot(conf_mat(predictions, truth = Product, estimate = .pred_class), type = "heatmap") +
+  labs(title = "Model Product estimates versus True Product values") +
+  theme(plot.title = element_text(hjust = 0.5, vjust = 0.5, face = "bold"))
+
+```
+
+Metrics results table:
+
+```{r metrics, echo=FALSE}
+kable(metrics)
+```
+
+Most common words used in each product category:
+
+```{r words, echo=FALSE}
+plot(p1)
+```
+
+Out of sample matrix:
+
+```{r accuracy, echo=FALSE}
+plot(p2)
+```
+
