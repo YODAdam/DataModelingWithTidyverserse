@@ -1,0 +1,209 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, echo=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(dtplyr)
+library(textstem)
+library(tidymodels)
+library(ranger)
+setwd("C:/Users/hp/Documents/ETUDES/Modeling_data_tidyverse")
+
+```
+
+# 1. Data Loading and Exploration
+
+First, we load the training and testing datasets containing consumer complaints:
+
+```{r}
+train_data <- read_csv(file = "data/data_complaints_train.csv")
+testing_data <- read_csv(file = "data/data_complaints_test.csv")
+
+# Examine the structure of the training data
+train_data %>% glimpse()
+```
+
+The dataset contains consumer complaint narratives along with their associated product categories. Let's look at an example complaint:
+
+```{r}
+train_data %>% 
+  slice(1) %>% 
+  pull(`Consumer complaint narrative`)
+
+```
+
+# 2. Text Preprocessing
+
+We add unique identifiers to each complaint and begin tokenization:
+
+```{r}
+train_data <- train_data %>% 
+  mutate(id_number = row_number())
+
+# Tokenize the complaints into individual words
+data_token <- train_data %>% 
+  select(Product, id_number, `Consumer complaint narrative`) %>% 
+  unnest_tokens(output = word, input = `Consumer complaint narrative`) %>% 
+  select(Product, id_number, word) %>%
+  filter(
+    !str_detect(word, "xx"),        # Remove words with successive x's
+    !str_detect(word, "[0-9]"),     # Remove words containing numbers
+    nchar(word) <= 20               # Keep words with max length of 20
+  ) %>% 
+  mutate(
+    word = lemmatize_words(word),   # Reduce words to their root form
+    is_english = hunspell_check(word, dict = hunspell::dictionary("en_US"))
+  ) 
+
+```
+
+We filter out non-English words to focus on standard English vocabulary:
+
+```{r}
+
+data_token <- data_token %>% 
+  filter(is_english)
+```
+
+# 3. Exploratory Data Analysis
+
+Let's examine the most frequent words in our corpus:
+
+```{r}
+data_token %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 100000) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word)) +
+  geom_col() +
+  labs(y = NULL, title = "Most Frequent Words in Complaint Narratives")
+
+```
+
+We remove common stop words that don't carry meaningful information:
+
+```{r}
+
+data("stop_words")
+data_token <- data_token %>% 
+  anti_join(stop_words)
+
+# Re-examine word frequencies after removing stop words
+data_token %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 50000) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word)) +
+  geom_col() +
+  labs(y = NULL, title = "Most Frequent Words After Stop Word Removal")
+
+```
+
+# 4. Feature Engineering with TF-IDF
+
+We select the top 20 words as features and compute TF-IDF (Term Frequency-Inverse Document Frequency) to identify words that are important to specific complaints:
+
+```{r}
+chosen_features <- data_token %>% 
+  count(word, sort = TRUE) %>% pull(word) %>% .[1:20]
+
+tf_idf_data <- data_token %>% 
+  count(word, id_number, sort=TRUE) %>% 
+  bind_tf_idf(word, id_number, n) %>% 
+  arrange(desc(tf_idf))
+
+# Create a wide format dataset with TF-IDF values
+tf_idf_data_long <- tf_idf_data %>% 
+  filter(word %in% chosen_features) %>% 
+  select(word, id_number, tf_idf) %>%
+  pivot_wider(id_cols = id_number, names_from = word, values_from = tf_idf, values_fill = 0.0) 
+
+```
+
+# 5. Preparing Data for Machine Learning
+
+We combine the TF-IDF features with the product labels:
+
+```{r}
+final_train_data <- train_data %>% 
+  select(id_number, Product) %>% 
+  left_join(tf_idf_data_long) %>% 
+  select(!id_number) %>% 
+  mutate(across(!Product, ~replace_na(., 0.0)))
+```
+
+# 6. Model Training with Random Forest
+
+We split the data and train a Random Forest classifier:
+
+```{r}
+set.seed(123)
+data_split <- initial_split(final_train_data, prop = 0.8, strata = Product)
+training_data <- training(data_split)
+testing_data  <- testing(data_split)
+
+# Define the recipe for preprocessing
+rf_recipe <- recipe(Product ~ ., data = training_data) %>% 
+  step_impute_mean()
+
+# Specify the Random Forest model
+rf_spec <- rand_forest(
+  mtry = 5,       # Number of variables randomly sampled as candidates at each split
+  trees = 500,    # Number of trees in the forest
+  min_n = 5       # Minimum number of data points in a node
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Create workflow and train the model
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_spec)
+
+rf_fit <- rf_workflow %>%
+  fit(data = training_data)
+
+```
+
+#7. Model Evaluation Finally, we evaluate the model's performance on the testing set:
+
+```{r}
+# Generate predictions
+rf_preds <- predict(rf_fit, testing_data) %>%
+  bind_cols(testing_data)
+
+# Calculate performance metrics
+metrics <- rf_preds %>%
+  mutate(
+    Product = factor(Product),
+    .pred_class = factor(.pred_class)
+  ) %>% 
+  metrics(truth = Product, estimate = .pred_class)
+
+# Create confusion matrix
+conf_mat <- rf_preds %>%
+  mutate(
+    Product = factor(Product),
+    .pred_class = factor(.pred_class)
+  ) %>% 
+  conf_mat(truth = Product, estimate = .pred_class)
+
+print(metrics)
+print(conf_mat)
+
+```
+
+# Summary
+
+-   This analysis demonstrates a complete text classification pipeline:
+-   Text preprocessing and tokenization
+-   Feature engineering using TF-IDF
+-   Machine learning model training with Random Forest
+-   Model evaluation and performance metrics
+
+The approach can be extended by experimenting with different feature selection methods, trying alternative algorithms, or incorporating more sophisticated text representation techniques like word embeddings.
