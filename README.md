@@ -33,19 +33,6 @@ install.packages(c(
 ))
 ```
 
-## 📁 Project Structure
-```
-├── data/
-│   ├── data_complaints_train.csv      # Original training data
-│   ├── data_complaints_test.csv       # Original testing data
-│   ├── data_token.rds                 # Processed token data
-│   ├── tf_idf_data.rds                # TF-IDF transformed data
-│   ├── tf_idf_data_long.rds           # Wide format TF-IDF data
-│   └── final_training_data.rds        # Final training dataset
-├── script.R                           # Main analysis script
-└── README.md                          # Project documentation
-```
-
 ## 🔧 Implementation Details
 
 ### Data Preprocessing
